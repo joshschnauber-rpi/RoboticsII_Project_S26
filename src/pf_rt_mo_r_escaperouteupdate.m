@@ -1,70 +1,64 @@
 clear; clc; close all;
 rng('shuffle');
 
-%% Parameters
-dt = 0.1;
-L = 1.0;
-N = 500;
-maxSteps = 600;
 
-goal = [27; 27];
-world = [-5 30 -5 30];   % boundary for path traversion (changeable)
 
-% Measurement noise distribution
-R = diag([0.01, 0.01, 0.002]);
-Q = diag([0.12, 0.12, 0.01]);
-R_sqrt = chol(R, 'lower');
-Q_sqrt = chol(Q, 'lower');
-
-% Obstacle noise (measured)
-obs_sigma = 0.45;      % noise center measurements
-vel_sigma = 0.08;      % noise velocity measurements
-pred_horizon = 1.0;    % "prediction" of movement factor
-
-% Video saving stuff
-save_video = true;
-video_filename = 'pf_moving_obstacles_escape_mode_3.mp4';
+%% Video saving parameters
+save_video = false;
+video_filename = 'vid_1.mp4';
 video_fps = 15;
 
-% robot initial pose/state
-x_true = [0; 0; 0];
 
-% Initial robot measurement
-z0 = x_true + Q_sqrt * randn(3,1);
-z0(3) = wrapToPi_local(z0(3));
+%% Simulation parameters
+init_robot_conf = [0, 0, 0];
+goal_pos = [27, 27];
+goal_distance_tol = 1.0;
+world = [-5 30; -5 30];   % boundary for path traversion (changeable)
 
-% particle creation
-particles = zeros(3,N);
-particles(1,:) = z0(1) + 2.0*randn(1,N);
-particles(2,:) = z0(2) + 2.0*randn(1,N);
-particles(3,:) = wrapToPi_local(z0(3) + 0.25*randn(1,N));
-weights = ones(1,N) / N;
-x_est = particle_mean(particles, weights);
+L = 1.0;
+K_v = 5.0;
+K_h = 1.0;
+max_speed = 2.0;
+max_gamma = pi / 6;
+dt = 0.1;
+maxSteps = 1000;
 
-%% Moving obstacles
-numObs = 3;
+obs_distance_factor = 30.0;
 
-obs.radii = 2.5 + 1.5*rand(1,numObs);   % randomizing the radius between 2.5 and 4.0
-obs.centers = zeros(2,numObs);
-obs.vel = zeros(2,numObs);
+% Measurement noise distribution
+Q_robot_conf = diag([0.12, 0.12, 0.01]);
+Q_obs_center = diag([0.15, 0.15]);
+Q_obs_vel = diag([0.15, 0.15]);
 
-for j = 1:numObs
+% Movement noise
+R_robot = diag([0.005, 0.005, 0.002]); % 
+
+% Initialize robot initial pose/state
+robot_conf = init_robot_conf;
+
+% Initialize moving obstacles
+num_obs = 3;
+obs.radii = 2.5 + 1.5*rand(1, num_obs);   % randomizing the radius between 2.5 and 4.0
+obs.centers = zeros(num_obs, 2);
+obs.vels = zeros(num_obs, 2);
+
+for j = 1:num_obs
     valid = false;
     while ~valid
         % ensure obstacles bounce from their boundary
-        cx = world(1) + obs.radii(j) + (world(2)-world(1)-2*obs.radii(j))*rand;
-        cy = world(3) + obs.radii(j) + (world(4)-world(3)-2*obs.radii(j))*rand;
+        cx = world(1, 1) + obs.radii(j) + (world(1, 2)-world(1, 1)-2*obs.radii(j))*rand;
+        cy = world(2, 1) + obs.radii(j) + (world(2, 2)-world(2, 1)-2*obs.radii(j))*rand;
 
         ctest = [cx; cy];
 
         % obstacles not starting near the start or goal position
-        far_from_start = norm(ctest - x_true(1:2)) > 8;
-        far_from_goal  = norm(ctest - goal) > 8;
+        far_from_start = norm(ctest - robot_conf(1:2)) > 8;
+        far_from_goal  = norm(ctest - goal_pos) > 8;
 
         % stop obstacles from overlapping initially
         no_overlap = true;
         for m = 1:j-1
-            if norm(ctest - obs.centers(:,m)) < (obs.radii(j) + obs.radii(m) + 3)
+            if norm(ctest - obs.centers(m,:)) < (obs.radii(j) + obs.radii(m) + 3)
                 no_overlap = false;
                 break;
             end
@@ -73,78 +67,81 @@ for j = 1:numObs
         valid = far_from_start && far_from_goal && no_overlap;
     end
 
-    obs.centers(:,j) = ctest;
+    obs.centers(j,:) = ctest;
 
     % random straight line speed
     speed = 0.25 + (2 - 0.25)*rand;   % speed between 0.25 and 2
     ang = 2*pi*rand;                  % random line/vector for direction
-    obs.vel(:,j) = speed*[cos(ang); sin(ang)];
+    obs.vels(j,:) = speed*[cos(ang); sin(ang)];
 end
 
-% initializing obstacle measurements with noise
-obs_meas = obs.centers + obs_sigma * randn(size(obs.centers));
-obs_vel_meas = obs.vel + vel_sigma * randn(size(obs.vel));
+% Initialize estimation
+[robot_conf_z, obs_vel_z, obs_centers_z] = measure_environment(robot_conf, obs.vels, obs.centers, Q_robot_conf, Q_obs_vel, Q_obs_center);
+robot_conf_est = robot_conf_z;
+robot_conf_cov = Q_robot_conf;
+u = [0 0 0];
 
-%% storing/initializing data points
-true_hist = x_true;
-est_hist  = x_est;
-meas_hist = z0;
-Neff_hist = [];
+% Particle creation
+num_particles = 20^2;
+xp = linspace(world(1, 1), world(1, 2), sqrt(num_particles));
+yp = linspace(world(2, 1), world(2, 2), sqrt(num_particles));
+[X, Y] = meshgrid(xp, yp);
+particle_pos = [X(:), Y(:)];
+particle_weights = zeros(num_particles, 1);
 
-obs_hist = cell(1, numObs);
-for j = 1:numObs
-    obs_hist{j} = obs.centers(:,j);
+particle_distance = 2.0 * (world(1, 2) - world(1, 1)) / sqrt(num_particles);
+max_distance = 1.5*norm(world(:,1) - world(:,2));
+
+particle_neighbors = cell(num_particles,1);
+for i = 1:num_particles
+    particle_neighbors{i} = find_neighbors(particle_pos, particle_pos(i,:), particle_distance);
 end
 
-%% Stuck detection / escape mode settings
-goal_dist_hist = norm(x_est(1:2) - goal);
-stuck_count = 0;
-escape_mode = false;
-escape_timer = 0;
-escape_dir = 1;              %d determine which way to turn
 
-progress_window = 12;        % history of steps 
-progress_thresh = 0.35;      % goal distance comparative
-stuck_trigger = 6;           % how many progress checks before turning
-escape_duration = 18;        % turn away will last 18 steps unless path is clear earlier
-escape_clearance_thresh = 4.0;
+%% Storing/initializing data points
+robot_conf_hist(1,:) = robot_conf;
+robot_conf_est_hist(1,:) = robot_conf;
+
+obs_centers_hist = cell(1, num_obs);
+for j = 1:num_obs
+    obs_centers_hist{j} = obs.centers(j,:);
+end
 
 %% Figures
-fig1 = figure('Color','w','Position',[100 100 1000 750]);
+fig1 = figure('Color','r','Position',[100 100 1000 750]);
+fig1.Color = 'w';
+set(gca, 'Color', 'w');
 hold on; grid on; axis equal;
-xlim(world(1:2));
-ylim(world(3:4));
-xlabel('x position');
-ylabel('y position');
-title('Particle Filter with Moving Obstacles - Real-Time Trajectory');
+xlim(world(1,:));
+ylim(world(2,:));
+xlabel('x position', 'Color', 'k');
+ylabel('y position', 'Color', 'k');
+title('Particle Field with Moving Obstacles - Real-Time Trajectory', 'Color', 'k');
 
-hParticles = scatter(particles(1,:), particles(2,:), 8, 'b', 'filled', 'DisplayName', 'Particles');
-
-hTruePath = plot(true_hist(1,:), true_hist(2,:), 'k-', 'LineWidth', 2, 'DisplayName', 'True Path');
-hEstPath = plot(est_hist(1,:), est_hist(2,:), 'm--', 'LineWidth', 2, 'DisplayName', 'Estimated Path');
-
-hTrueNow = plot(x_true(1), x_true(2), 'ko', 'MarkerFaceColor', 'k', 'MarkerSize', 8, 'DisplayName', 'True Position');
-hEstNow = plot(x_est(1), x_est(2), 'mo', 'MarkerFaceColor', 'm', 'MarkerSize', 8, 'DisplayName', 'Estimated Position');
-hMeasNow = plot(z0(1), z0(2), 'rx', 'MarkerSize', 10, 'LineWidth', 2, 'DisplayName', 'Robot Measurement');
-
-hGoal = plot(goal(1), goal(2), 'g*', 'MarkerSize', 14, 'DisplayName', 'Goal');
-
-hObsCircle = gobjects(1, numObs);
-hObsTrail  = gobjects(1, numObs);
-hObsMeas   = gobjects(1, numObs);
-
-for j = 1:numObs
-    [xc, yc] = circle_points(obs.centers(:,j), obs.radii(j));
-    hObsCircle(j) = plot(xc, yc, 'k-', 'LineWidth', 2);
-    hObsTrail(j)  = plot(obs_hist{j}(1,:), obs_hist{j}(2,:), 'Color', [0.2 0.6 0.2], ...
-                         'LineStyle', '--', 'LineWidth', 1.5);
-    hObsMeas(j)   = plot(obs_meas(1,j), obs_meas(2,j), 'rx', 'MarkerSize', 10, 'LineWidth', 2);
+h_robot_conf_z =    plot(robot_conf(1), robot_conf(2), 'rx', 'MarkerSize', 10, 'LineWidth', 2, 'DisplayName', 'Measured Position');
+h_robot_conf_est =  plot(robot_conf(1), robot_conf(2), 'mo', 'MarkerFaceColor', 'm', 'MarkerSize', 8, 'DisplayName', 'Estimated Position');
+h_goal =            plot(goal_pos(1), goal_pos(2), 'g*', 'MarkerSize', 14, 'DisplayName', 'Goal');
+h_robot_path =      plot(robot_conf_hist(:,1), robot_conf_hist(:,1), 'k-', 'LineWidth', 2, 'DisplayName', 'True Path');
+h_robot_est_path =  plot(robot_conf_est_hist(:,1), robot_conf_est_hist(:,2), 'm--', 'LineWidth', 2, 'DisplayName', 'Estimated Path');
+h_robot_target_path=plot(robot_conf_hist(:,1), robot_conf_hist(:,2), 'b--', 'LineWidth', 2, 'DisplayName', 'Target Path');
+h_particles =       scatter(particle_pos(:,1), particle_pos(:,2), 16, particle_weights, 'filled', 'DisplayName', 'Particles');
+clim([0, 15]);
+h_robot_conf =      DrawRobot(1,2,robot_conf(1),robot_conf(2),robot_conf(3));
+h_obs_circles =     gobjects(1, num_obs);
+h_obs_centers_est = gobjects(1, num_obs);
+h_obs_paths =       gobjects(1, num_obs);
+for j = 1:num_obs
+    [xc, yc] = circle_points(obs.centers(j,:), obs.radii(j));
+    h_obs_circles(j) =      plot(xc, yc, 'r-', 'LineWidth', 2);
+    h_obs_centers_est(j) =  plot(obs.centers(j,1), obs.centers(j,2), 'rx', 'MarkerSize', 10, 'LineWidth', 2);
+    h_obs_paths(j) =        plot(obs_centers_hist{j}(:,1), obs_centers_hist{j}(:,2), 'Color', 'black', ...
+                                'LineStyle', '--', 'LineWidth', 1.5);
 end
 
-legend({'Particles','True Path','Estimated Path','True Position','Estimated Position','Robot Measurement','Goal'}, ...
-    'Location','bestoutside');
+lgd = legend({'Measured Position', 'Estimated Position', 'Goal', 'True Path', 'Estimated Path', 'Target Path'}, 'Location', 'bestoutside', 'Color', 'k');
+lgd.Color = 'w';
+colorbar;
 
-% video saving/opening
 if save_video
     vobj = VideoWriter(video_filename, 'MPEG-4');
     vobj.FrameRate = video_fps;
@@ -156,365 +153,273 @@ if save_video
     writeVideo(vobj, frame);
 end
 
-%% Control and movement action
-invQ = inv(Q);
 
+
+%% Control and movement action simulation
 for k = 1:maxSteps
+    % Terminate near goal
+    if norm(robot_conf(1:2) - goal_pos) < goal_distance_tol
+        break;
+    end
 
-    % update obstacle motion
-    obs = update_obstacles(obs, dt, world);
+    % Sense things in environment
+    [robot_conf_z, obs_vels_z, obs_centers_z] = measure_environment(robot_conf, obs.vels, obs.centers, Q_robot_conf, Q_obs_vel, Q_obs_center);
 
-    % updating obstacle measurements with noise
-    obs_meas = obs.centers + obs_sigma * randn(size(obs.centers));
-    obs_vel_meas = obs.vel + vel_sigma * randn(size(obs.vel));
+    % Estimate robot state
+    robot_conf_cov_bar = robot_conf_cov + R_robot;
+    robot_conf_est_bar = robot_conf_est + (dt * u);
 
-    % checking if trapped
-    goal_dist = norm(x_est(1:2) - goal);
-    goal_dist_hist(end+1) = goal_dist;
+    K = robot_conf_cov_bar / (robot_conf_cov_bar + Q_robot_conf);
+    robot_conf_cov = (eye(3) - K) * robot_conf_cov_bar;
+    robot_conf_est = robot_conf_est_bar + transpose(K * transpose(robot_conf_z - robot_conf_est_bar)); 
 
-    if length(goal_dist_hist) > progress_window
-        progress = goal_dist_hist(end-progress_window) - goal_dist_hist(end);
+    % 'Estimate' obstacle state
+    obs_vels_est = obs_vels_z;
+    obs_centers_est = obs_centers_z;
 
-        if progress < progress_thresh && goal_dist > 3.0
-            stuck_count = stuck_count + 1;
-        else
-            stuck_count = max(stuck_count - 1, 0);
+
+    % Weigh each particle based on proximity to goal and obstacles
+    for i = 1:num_particles
+        pos = particle_pos(i,:);
+        
+        % Weight higher based on further distance from obstacles
+        obs_w = 0;
+        for j = 1:num_obs
+            obs_pos = obs_centers_est(j,:);
+            obs_radius = obs.radii(j);
+            obs_dist = max(norm(pos - obs_pos) - obs_radius, eps);
+            obs_w = obs_w + (obs_distance_factor / obs_dist);
         end
+        
+        particle_weights(i) = obs_w;
     end
 
-    if ~escape_mode && stuck_count >= stuck_trigger
-        escape_mode = true;
-        escape_timer = escape_duration;
-        escape_dir = choose_escape_direction(x_est, goal, obs_meas);
-    end
-
-    % control (robot and obstacle measurement
-    [v, gamma, min_clearance] = controller_with_moving_obstacles( ...
-        x_est, goal, obs_meas, obs_vel_meas, obs.radii, pred_horizon, ...
-        escape_mode, escape_dir);
-
-    % update escape state
-    if escape_mode
-        escape_timer = escape_timer - 1;
-
-        if min_clearance > escape_clearance_thresh || escape_timer <= 0
-            escape_mode = false;
-            stuck_count = 0;
-        end
-    end
-
-    % path control
-    x_true = motion_model(x_true, v, gamma, L, dt);
-    x_true = x_true + R_sqrt * randn(3,1);
-    x_true(3) = wrapToPi_local(x_true(3));
-
-    % robot pose update
-    z = x_true + Q_sqrt * randn(3,1);
-    z(3) = wrapToPi_local(z(3));
-
-    % particle propagation
-    for i = 1:N
-        particles(:,i) = motion_model(particles(:,i), v, gamma, L, dt);
-        particles(:,i) = particles(:,i) + R_sqrt * randn(3,1);
-        particles(3,i) = wrapToPi_local(particles(3,i));
-    end
-
-    %% Particle weighting update (robot measurement and obstacle penalty)
-    for i = 1:N
-        err = z - particles(:,i);
-        err(3) = wrapToPi_local(err(3));
-
-        w_meas = exp(-0.5 * err.' * invQ * err);
-        w_obs  = moving_obstacle_penalty( ...
-            particles(:,i), obs_meas, obs_vel_meas, obs.radii, pred_horizon);
-
-        weights(i) = w_meas * w_obs;
-    end
-
-    weights = weights + 1e-300;
-    weights = weights / sum(weights);
-
-    % estimate robot state using particles
-    x_est = particle_mean(particles, weights);
-
-    % Effective particles
-    Neff = 1 / sum(weights.^2);
-    Neff_hist(end+1) = Neff;
-
-    %% Resample
-    if Neff < N/2
-        idx = systematic_resample(weights);
-        particles = particles(:,idx);
-        weights = ones(1,N) / N;
-    end
-
-    %% store data points
-    true_hist(:,end+1) = x_true;
-    est_hist(:,end+1)  = x_est;
-    meas_hist(:,end+1) = z;
-
-    for j = 1:numObs
-        obs_hist{j}(:,end+1) = obs.centers(:,j);
-    end
-
-    %% live plot updating
-    set(hParticles, 'XData', particles(1,:), 'YData', particles(2,:));
-    set(hTruePath, 'XData', true_hist(1,:), 'YData', true_hist(2,:));
-    set(hEstPath,  'XData', est_hist(1,:),  'YData', est_hist(2,:));
-    set(hTrueNow,  'XData', x_true(1),      'YData', x_true(2));
-    set(hEstNow,   'XData', x_est(1),       'YData', x_est(2));
-    set(hMeasNow,  'XData', z(1),           'YData', z(2));
-
-    for j = 1:numObs
-        [xc, yc] = circle_points(obs.centers(:,j), obs.radii(j));
-        set(hObsCircle(j), 'XData', xc, 'YData', yc);
-        set(hObsTrail(j),  'XData', obs_hist{j}(1,:), 'YData', obs_hist{j}(2,:));
-        set(hObsMeas(j),   'XData', obs_meas(1,j), 'YData', obs_meas(2,j));
-    end
-
-    % show escape mode in title
-    if escape_mode
-        title('Particle Filter with Moving Obstacles - ESCAPE MODE');
+    % Use A* to find path
+    target_path = A_star(particle_pos, particle_weights, particle_neighbors, robot_conf_est(1:2), goal_pos, particle_distance);
+    if isempty(target_path)
+        target_pos = robot_conf_est(1:2);
+        target_path(end+1,:) = target_pos;
+        disp("No path found");
     else
-        title('Particle Filter with Moving Obstacles - Real-Time Trajectory');
+        target_pos = target_path(2,:);
+    end
+    
+    % Determine robot movement to move towards target
+    err = K_v * norm(target_pos - robot_conf_est(1:2));
+    speed = min(err, max_speed);
+    target_theta = atan2(target_pos(2) - robot_conf_est(2), target_pos(1) - robot_conf_est(1));
+    gamma = K_h * wrapToPi_local(target_theta - robot_conf(3));
+    gamma = clip(gamma, -max_gamma, max_gamma);
+    
+
+    % Store data points
+    robot_conf_hist(end+1,:) = robot_conf;
+    robot_conf_est_hist(end+1,:) = robot_conf_est;
+    for j = 1:num_obs
+        obs_centers_hist{j}(end+1,:) = obs.centers(j,:);
     end
 
+    % Live plot updating    
+    delete(h_robot_conf);
+    h_robot_conf =          DrawRobot(1,2,robot_conf(1),robot_conf(2),robot_conf(3));
+    set(h_robot_conf_z,     'XData', robot_conf_z(1),           'YData', robot_conf_z(2));
+    set(h_robot_conf_est,   'XData', robot_conf_est(1),         'YData', robot_conf_est(2));
+    set(h_robot_path,       'XData', robot_conf_hist(:,1),      'YData', robot_conf_hist(:,2));
+    set(h_robot_est_path,   'XData', robot_conf_est_hist(:,1),  'YData', robot_conf_est_hist(:,2));
+    set(h_robot_target_path,'XData', target_path(:,1),          'YData', target_path(:,2));
+    set(h_particles,        'XData', particle_pos(:,1),         'YData', particle_pos(:,2), 'CData', particle_weights);
+    for j = 1:num_obs
+        [xc, yc] = circle_points(obs.centers(j,:), obs.radii(j));
+        set(h_obs_circles(j),       'XData', xc,                        'YData', yc);
+        set(h_obs_centers_est(j),   'XData', obs_centers_est(j,1),      'YData', obs_centers_est(j,2));
+        set(h_obs_paths(j),         'XData', obs_centers_hist{j}(:,1),  'YData', obs_centers_hist{j}(:,2));
+    end
     drawnow;
 
+    % Update video
     if save_video
         frame = getframe(fig1);
         writeVideo(vobj, frame);
     end
 
-    pause(0.02);
 
-    %% stop at/near goal
-    if norm(x_true(1:2) - goal) < 1.0
-        disp(['Goal reached in ', num2str(k), ' steps.']);
-        disp(['Elapsed time = ', num2str(k*dt), ' seconds.']);
-        break;
-    end
+    % Update robot state
+    u = motion_model(robot_conf, speed, gamma, L, dt);
+    robot_conf = robot_conf + u + sample_normal(zeros(1, 3), R_robot);
+    robot_conf(3) = wrapToPi_local(robot_conf(3));
+
+    % Update obstacle states
+    obs = update_obstacles(obs, dt, world);
+
+    
+    pause(dt * 0.1);
 end
 
-%% video closing
+
+
+%% Display results
+disp(['Goal reached in ', num2str(k), ' steps.']);
+disp(['Elapsed time = ', num2str(k*dt), ' seconds.']);
+
+%% Video closing
 if save_video
     close(vobj);
     disp(['Video saved as: ', video_filename]);
 end
 
-%% effective particles plot
-figure('Color','w');
-plot(Neff_hist, 'LineWidth', 1.8);
-grid on;
-xlabel('Time step');
-ylabel('N_{eff}');
-title('Effective Number of Particles');
 
-%% function calls
-function xnext = motion_model(x, v, gamma, L, dt)
-    theta = x(3);
-    xnext = [x(1) + v*cos(theta)*dt;
-             x(2) + v*sin(theta)*dt;
-             x(3) + (v/L)*tan(gamma)*dt];
-    xnext(3) = wrapToPi_local(xnext(3));
+
+%% Helper Functions
+function a = wrapToPi_local(a)
+    a = mod(a + pi, 2*pi) - pi;
 end
 
-function [v, gamma, min_clearance] = controller_with_moving_obstacles(x, goal, obsC, obsV, obsR, predH, escape_mode, escape_dir)
+function s = sample_normal(mean, cov)
+    dim = size(mean);
+    s = mean + mvnrnd(zeros(dim(2), 1), cov, dim(1));
+end
 
-    p = x(1:2);
-    theta = x(3);
+function [robot_conf_z, obs_vels_z, obs_centers_z] = measure_environment(robot_conf, obs_vel, obs_centers, Q_robot_conf, Q_obs_vel, Q_obs_center)
+    % Get robot state from sensor
+    robot_conf_z = sample_normal(robot_conf, Q_robot_conf);
+    robot_conf_z(3) = wrapToPi_local(robot_conf_z(3));
+    % Get obstacle state from sensor
+    obs_vels_z = sample_normal(obs_vel, Q_obs_vel);
+    obs_centers_z = sample_normal(obs_centers, Q_obs_center);
+end
 
-    v_nom = 2.5;
-    gamma_max = pi/3;
-    k_gamma = 1.8;
+% Find neighbors of particle
+function neighbors = find_neighbors(particles, particle, neighbor_dist)    
+    dists = vecnorm(particles - particle, 2, 2);
+    neighbors = transpose(find(dists <= neighbor_dist & dists > 0));
+end
 
-    % Attractive goal direction
-    att = goal - p;
-    att = att / (norm(att) + 1e-9);
-
-    vec = att;
-    min_clearance = inf;
-    nearest_idx = 1;
-    nearest_clear = inf;
-
-    influence_dist = 8.0;
-    pred_influence = 10.0;
-    rep_gain_cur = 2.2;
-    rep_gain_pred = 1.8;
-
-    for j = 1:length(obsR)
-        c_now = obsC(:,j);
-        c_pred = obsC(:,j) + obsV(:,j) * predH;
-
-        % Current obstacle repulsion
-        dvec_now = p - c_now;
-        dist_now = norm(dvec_now);
-        clear_now = dist_now - obsR(j);
-
-        if clear_now < nearest_clear
-            nearest_clear = clear_now;
-            nearest_idx = j;
-        end
-
-        min_clearance = min(min_clearance, clear_now);
-
-        if clear_now < influence_dist
-            away_now = dvec_now / (dist_now + 1e-9);
-            strength_now = rep_gain_cur * max(0, (1/max(clear_now,0.35) - 1/influence_dist));
-            vec = vec + strength_now * away_now;
-        end
-
-        % Predicted obstacle repulsion
-        dvec_pred = p - c_pred;
-        dist_pred = norm(dvec_pred);
-        clear_pred = dist_pred - obsR(j);
-        min_clearance = min(min_clearance, clear_pred);
-
-        if clear_pred < pred_influence
-            away_pred = dvec_pred / (dist_pred + 1e-9);
-            strength_pred = rep_gain_pred * max(0, (1/max(clear_pred,0.35) - 1/pred_influence));
-            vec = vec + strength_pred * away_pred;
-        end
-    end
-
-    % trapped: will turn towards one tangent direction of obstacle
-    if escape_mode
-        away = p - obsC(:,nearest_idx);
-        if norm(away) < 1e-6
-            away = [cos(theta); sin(theta)];
-        end
-        away_u = away / (norm(away) + 1e-9);
-        tangent_u = escape_dir * [-away_u(2); away_u(1)];
-
-        % adding goal pull and obstacle push to turn away
-        vec = 1.8*tangent_u + 0.8*away_u + 0.5*att;
-    end
-
-    theta_des = atan2(vec(2), vec(1));
-    e = wrapToPi_local(theta_des - theta);
-    gamma = max(min(k_gamma * e, gamma_max), -gamma_max);
-
-    % stronger repulsion in turn away
-    if escape_mode
-        gamma = max(min(1.15*gamma, gamma_max), -gamma_max);
-        v = max(2.2, 0.9*v_nom);
-    else
-        %  speed 
-        if min_clearance < 1.0
-            v = 2;
-        elseif min_clearance < 2.0
-            v = 3;
-        elseif min_clearance < 3.5
-            v = 5;
-        else
-            v = v_nom;
-        end
+% Reconstruct path backwards
+function path = reconstruct_path(came_from, current, points)
+    path = points(current,:);
+    while came_from(current) ~= 0
+        current = came_from(current);
+        path = [points(current,:); path];
     end
 end
 
-function dir = choose_escape_direction(x, goal, obsC)
-    % turn away direction based on goal proximity
-    p = x(1:2);
+function path = A_star(particles, particle_weights, particle_neighbors, start_pos, goal_pos, neighbor_dist)
+    % Add start and end points to particles
+    particles(end+1,:) = goal_pos;
+    particle_weights(end+1) = 0;
+    particle_neighbors{end+1} = find_neighbors(particles, goal_pos, neighbor_dist);
+    particles(end+1,:) = start_pos;
+    particle_weights(end+1) = 0;
+    particle_neighbors{end+1} = find_neighbors(particles, start_pos, neighbor_dist);
+    
+    num_particles = size(particles, 1);
+    start_i = num_particles;
+    goal_i  = num_particles-1;
 
-    dists = vecnorm(obsC - p);
-    [~, idx] = min(dists);
-
-    away = p - obsC(:,idx);
-    if norm(away) < 1e-6
-        away = goal - p;
+    for i = 1:num_particles
+        pos = particles(i,:);
+        if norm(goal_pos - pos) < neighbor_dist
+            particle_neighbors{i}(end+1) = goal_i;
+        end
     end
 
-    t_left  = [-away(2);  away(1)];
-    t_right = [ away(2); -away(1)];
-    g = goal - p;
-
-    if dot(t_left, g) >= dot(t_right, g)
-        dir = 1;
-    else
-        dir = -1;
+    % A* initialization
+    g = inf(num_particles,1);
+    f = inf(num_particles,1);
+    function h = h(particle_i)
+        h = norm(particles(particle_i,:) - goal_pos);
     end
-end
 
-function w_obs = moving_obstacle_penalty(xp, obsC, obsV, obsR, predH)
-    % Penalize particles that are inside or near current/predicted obstacle locations
-    buffer_now = 1.8;
-    buffer_pred = 2.4;
-    sigma_now = 0.8;
-    sigma_pred = 1.0;
+    g(start_i) = 0;
+    f(start_i) = h(start_i);
 
-    w_obs = 1.0;
+    open_set = start_i;
+    came_from = zeros(num_particles,1);
 
-    for j = 1:length(obsR)
-        c_now  = obsC(:,j);
-        c_pred = obsC(:,j) + obsV(:,j) * predH;
+    while ~isempty(open_set)
+        % Get node in open_set with lowest f
+        [~, min_set_i] = min(f(open_set));
+        current_i = open_set(min_set_i);
 
-        d_now  = norm(xp(1:2) - c_now)  - obsR(j);
-        d_pred = norm(xp(1:2) - c_pred) - obsR(j);
-
-        % Hard penalty if particle is inside current or predicted obstacle region
-        if d_now <= 0 || d_pred <= -0.2
-            w_obs = 1e-10;
+        if current_i == goal_i
+            path = reconstruct_path(came_from, current_i, particles);
             return;
         end
 
-        % Soft penalty near current obstacle
-        if d_now < buffer_now
-            w_obs = w_obs * exp(-0.5 * ((buffer_now - d_now)/sigma_now)^2);
-        end
+        open_set(min_set_i) = [];
+        current_particle = particles(current_i,:);
 
-        % Soft penalty near predicted obstacle
-        if d_pred < buffer_pred
-            w_obs = w_obs * exp(-0.5 * ((buffer_pred - d_pred)/sigma_pred)^2);
+        % Explore neighbors
+        for neighbor_i = particle_neighbors{current_i}
+            neighbor_particle = particles(neighbor_i,:);
+
+            dist = norm(neighbor_particle - current_particle) + particle_weights(neighbor_i);
+            potential_g = g(current_i) + dist;
+
+            if potential_g < g(neighbor_i)
+                came_from(neighbor_i) = current_i;
+                g(neighbor_i) = potential_g;
+                f(neighbor_i) = potential_g + h(neighbor_i);
+
+                if ~ismember(neighbor_i, open_set)
+                    open_set(end+1) = neighbor_i;
+                end
+            end
         end
     end
 
-    w_obs = max(w_obs, 1e-12);
+    path = [];
+end
+
+function u = motion_model(x, v, gamma, L, dt)
+    theta = x(3);
+    u = [v*cos(theta)*dt, v*sin(theta)*dt, (v/L)*tan(gamma)*dt];
 end
 
 function obs = update_obstacles(obs, dt, world)
     % Move each circular obstacle, bounce off boundaries,
     % and prevent overlap with other obstacles.
 
-    xmin = world(1); xmax = world(2);
-    ymin = world(3); ymax = world(4);
+    xmin = world(1, 1); xmax = world(1, 2);
+    ymin = world(2, 1); ymax = world(2, 2);
 
-    numObs = length(obs.radii);
+    num_obs = length(obs.radii);
 
     % move all obstacles
-    for j = 1:numObs
-        obs.centers(:,j) = obs.centers(:,j) + obs.vel(:,j) * dt;
+    for j = 1:num_obs
+        obs.centers(j,:) = obs.centers(j,:) + obs.vels(j,:) * dt;
     end
 
     % bounce off walls
-    for j = 1:numObs
+    for j = 1:num_obs
         r = obs.radii(j);
 
         % x direction
-        if obs.centers(1,j) - r < xmin
-            obs.centers(1,j) = xmin + r;
-            obs.vel(1,j) = -obs.vel(1,j);
-        elseif obs.centers(1,j) + r > xmax
-            obs.centers(1,j) = xmax - r;
-            obs.vel(1,j) = -obs.vel(1,j);
+        if obs.centers(j,1) - r < xmin
+            obs.centers(j,1) = xmin + r;
+            obs.vels(j,1) = -obs.vels(j,1);
+        elseif obs.centers(j,1) + r > xmax
+            obs.centers(j,1) = xmax - r;
+            obs.vels(j,1) = -obs.vels(j,1);
         end
 
         % y direction
-        if obs.centers(2,j) - r < ymin
-            obs.centers(2,j) = ymin + r;
-            obs.vel(2,j) = -obs.vel(2,j);
-        elseif obs.centers(2,j) + r > ymax
-            obs.centers(2,j) = ymax - r;
-            obs.vel(2,j) = -obs.vel(2,j);
+        if obs.centers(j,2) - r < ymin
+            obs.centers(j,2) = ymin + r;
+            obs.vels(j,2) = -obs.vels(j,2);
+        elseif obs.centers(j,2) + r > ymax
+            obs.centers(j,2) = ymax - r;
+            obs.vels(j,2) = -obs.vels(j,2);
         end
     end
 
     % prevent obstacle-obstacle overlap
     buffer = 0.3;
 
-    for i = 1:numObs-1
-        for j = i+1:numObs
-            c1 = obs.centers(:,i);
-            c2 = obs.centers(:,j);
+    for i = 1:num_obs-1
+        for j = i+1:num_obs
+            c1 = obs.centers(i,:);
+            c2 = obs.centers(j,:);
 
             dvec = c2 - c1;
             dist = norm(dvec);
@@ -529,51 +434,36 @@ function obs = update_obstacles(obs, dt, world)
                 end
 
                 overlap = minDist - dist;
-                obs.centers(:,i) = obs.centers(:,i) - 0.5 * overlap * dir;
-                obs.centers(:,j) = obs.centers(:,j) + 0.5 * overlap * dir;
+                obs.centers(i,:) = obs.centers(i,:) - 0.5 * overlap * dir;
+                obs.centers(j,:) = obs.centers(j,:) + 0.5 * overlap * dir;
 
                 % collision reaction
-                obs.vel(:,i) = -obs.vel(:,i);
-                obs.vel(:,j) = -obs.vel(:,j);
+                obs.vels(i,:) = -obs.vels(i,:);
+                obs.vels(j,:) = -obs.vels(j,:);
             end
         end
     end
-end
-
-function idx = systematic_resample(w)
-    N = length(w);
-    positions = ((0:N-1) + rand(1))/N;
-    c = cumsum(w);
-    idx = zeros(1,N);
-
-    i = 1;
-    j = 1;
-    while i <= N
-        if positions(i) < c(j)
-            idx(i) = j;
-            i = i + 1;
-        else
-            j = j + 1;
-        end
-    end
-end
-
-function a = wrapToPi_local(a)
-    a = mod(a + pi, 2*pi) - pi;
-end
-
-function x_est = particle_mean(particles, weights)
-    x_est = zeros(3,1);
-    x_est(1) = sum(weights .* particles(1,:));
-    x_est(2) = sum(weights .* particles(2,:));
-
-    c = sum(weights .* cos(particles(3,:)));
-    s = sum(weights .* sin(particles(3,:)));
-    x_est(3) = atan2(s, c);
 end
 
 function [xc, yc] = circle_points(center, radius)
     ang = linspace(0, 2*pi, 200);
     xc = center(1) + radius*cos(ang);
     yc = center(2) + radius*sin(ang);
+end
+
+function plot_fig = DrawRobot( width, height, center_x, center_y, theta)
+        
+    corner1 = [center_x - 0.25*height * cos(theta) + (width/2) * sin(theta), center_y - (0.25*height)*sin(theta) - (width/2)*cos(theta)];
+    corner2 = [center_x - 0.25*height*cos(theta) - width/2*sin(theta),center_y - 0.25*height*sin(theta) + width/2*cos(theta)];
+    corner3 = [center_x + 0.75*height*cos(theta) - width/2*sin(theta),center_y + 0.75*height*sin(theta) + width/2*cos(theta)];
+    corner4 = [center_x + 0.75*height*cos(theta) + width/2*sin(theta),center_y + 0.75*height*sin(theta) - width/2*cos(theta)];
+
+    corners = [corner1;corner2;corner3;corner4;corner1];
+    corners = transpose(corners);
+    x = [center_x, center_y];
+    y = [center_x+height*cos(theta), center_y+height*sin(theta)];
+    plot_fig(1) = plot([x(1), y(1)], [x(2), y(2)], 'k-', 'HandleVisibility', 'off'); hold on;
+
+    plot_fig(2) = plot(corners(1,:),corners(2,:),'b', 'HandleVisibility', 'off');
+        
 end
