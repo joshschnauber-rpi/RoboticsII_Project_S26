@@ -4,8 +4,8 @@ rng('shuffle');
 
 
 %% Video saving parameters
-save_video = false;
-video_filename = 'vid_1.mp4';
+save_video = true;
+video_filename = 'vid_3.mp4';
 video_fps = 15;
 
 
